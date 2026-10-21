@@ -20,6 +20,8 @@ DEFAULTS = {
     "hover": True,
     "interp": True,
     "search": 60,
+    "ignore_black": True,
+    "black_thr": 70,
 }
 
 

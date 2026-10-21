@@ -37,7 +37,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("컨투어 값 판독기")
         self.geometry("1280x860")
-        self.minsize(900, 640)
+        self.minsize(960, 840)
 
         cfg = settings.load()
         self.colors: list[str] = list(cfg["colors"])
@@ -52,6 +52,8 @@ class App(tk.Tk):
         self.v_hover = tk.BooleanVar(value=bool(cfg["hover"]))
         self.v_interp = tk.BooleanVar(value=bool(cfg["interp"]))
         self.v_search = tk.IntVar(value=int(cfg["search"]))
+        self.v_black = tk.BooleanVar(value=bool(cfg["ignore_black"]))
+        self.v_black_thr = tk.IntVar(value=int(cfg["black_thr"]))
 
         self.img: Image.Image | None = None
         self.arr: np.ndarray | None = None
@@ -70,15 +72,16 @@ class App(tk.Tk):
         self._build_ui()
         self._bind_keys()
         for v in (self.v_min, self.v_max, self.v_unit, self.v_tol, self.v_sample, self.v_open,
-                  self.v_interp, self.v_search):
+                  self.v_interp, self.v_search, self.v_black, self.v_black_thr):
             v.trace_add("write", lambda *_: self._on_legend_change())
         self._refresh_swatches()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
-        left = ttk.Frame(self, padding=8)
+        left = ttk.Frame(self, padding=8, width=350)
         left.pack(side="left", fill="y")
+        left.pack_propagate(False)   # 내용 길이가 바뀌어도 좌측 패널 크기가 흔들리지 않게 고정
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True)
 
@@ -111,8 +114,19 @@ class App(tk.Tk):
         # 범례 색상
         f = ttk.LabelFrame(left, text="3. 범례 색상 (위=최대)", padding=6)
         f.pack(fill="x")
-        self.swatch_frame = ttk.Frame(f)
-        self.swatch_frame.pack(fill="x")
+        box = ttk.Frame(f, height=150)
+        box.pack(fill="x")
+        box.pack_propagate(False)
+        self.swatch_canvas = tk.Canvas(box, highlightthickness=0, height=150)
+        sb = ttk.Scrollbar(box, command=self.swatch_canvas.yview)
+        self.swatch_canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.swatch_canvas.pack(side="left", fill="both", expand=True)
+        self.swatch_frame = ttk.Frame(self.swatch_canvas)
+        self.swatch_canvas.create_window((0, 0), window=self.swatch_frame, anchor="nw")
+        self.swatch_frame.bind("<Configure>", lambda e: self.swatch_canvas.configure(
+            scrollregion=self.swatch_canvas.bbox("all")))
+        self._swatch_rows: list[tuple] = []
         bf = ttk.Frame(f)
         bf.pack(fill="x", pady=(6, 0))
         self.btn_pick = ttk.Button(bf, text="이미지에서 범례 추출", command=self.toggle_legend_mode)
@@ -136,6 +150,11 @@ class App(tk.Tk):
         ttk.Spinbox(f, from_=10, to=200, width=6, textvariable=self.v_search).grid(row=3, column=1, sticky="w", padx=4)
         ttk.Checkbutton(f, text="마우스 이동 시 실시간 값 표시", variable=self.v_hover).grid(
             row=4, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(f, text="검은색(선) 무시", variable=self.v_black).grid(
+            row=5, column=0, sticky="w", pady=2)
+        ttk.Spinbox(f, from_=0, to=120, width=5, textvariable=self.v_black_thr).grid(
+            row=5, column=1, sticky="w", padx=4)
+        ttk.Label(f, text="이하", foreground="#666").grid(row=5, column=2, sticky="w")
         f.columnconfigure(1, weight=1)
 
         # 결과 패널
@@ -145,10 +164,10 @@ class App(tk.Tk):
         self.res_swatch.grid(row=0, column=0, rowspan=2, padx=(0, 8), sticky="ns")
         self.res_value = tk.StringVar(value="-")
         self.res_info = tk.StringVar(value="이미지를 가져온 뒤 클릭하세요")
-        tk.Label(f, textvariable=self.res_value, font=(FONT, 15, "bold"), anchor="w",
-                 wraplength=250, justify="left").grid(row=0, column=1, sticky="w")
-        tk.Label(f, textvariable=self.res_info, font=(FONT, 9), anchor="w", fg="#555",
-                 justify="left", wraplength=250).grid(row=1, column=1, sticky="w")
+        tk.Label(f, textvariable=self.res_value, font=(FONT, 14, "bold"), anchor="nw", width=22, height=2,
+                 wraplength=240, justify="left").grid(row=0, column=1, sticky="w")
+        tk.Label(f, textvariable=self.res_info, font=(FONT, 9), anchor="nw", fg="#555", width=36, height=4,
+                 justify="left", wraplength=240).grid(row=1, column=1, sticky="w")
 
         bf = ttk.Frame(left)
         bf.pack(fill="x", pady=(6, 0))
@@ -186,7 +205,8 @@ class App(tk.Tk):
         try:
             return Legend(float(self.v_min.get()), float(self.v_max.get()), self.colors,
                           tolerance=self.v_tol.get(), open_ends=self.v_open.get(),
-                          unit=self.v_unit.get().strip())
+                          unit=self.v_unit.get().strip(), ignore_black=self.v_black.get(),
+                          black_threshold=self.v_black_thr.get())
         except (ValueError, tk.TclError) as e:
             if not quiet:
                 messagebox.showerror("입력 오류", str(e))
@@ -208,19 +228,30 @@ class App(tk.Tk):
             self._on_legend_change()
 
     def _refresh_swatches(self):
-        for w in self.swatch_frame.winfo_children():
-            w.destroy()
         lg = self._build_legend()
         n = len(self.colors)
-        for i in range(n - 1, -1, -1):
-            row = tk.Frame(self.swatch_frame)
-            row.pack(fill="x", pady=0)
-            sw = tk.Label(row, bg=self.colors[i], width=6, height=1, relief="solid", bd=1, cursor="hand2")
-            sw.pack(side="left")
-            sw.bind("<Button-1>", lambda e, k=i: self._edit_color(k))
-            txt = lg.short(i) if lg else "-"
-            tk.Label(row, text=txt, font=(FONT, 9), width=18, anchor="w").pack(side="left", padx=6)
-            tk.Label(row, text=self.colors[i], font=("Consolas", 8), fg="#888").pack(side="left")
+        if len(self._swatch_rows) != n:   # 구간 수가 바뀔 때만 위젯을 다시 만든다 (깜빡임/흔들림 방지)
+            for w in self.swatch_frame.winfo_children():
+                w.destroy()
+            self._swatch_rows = []
+            wheel = lambda e: self.swatch_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+            for i in range(n - 1, -1, -1):
+                row = tk.Frame(self.swatch_frame)
+                row.pack(fill="x")
+                sw = tk.Label(row, width=6, height=1, relief="solid", bd=1, cursor="hand2")
+                sw.pack(side="left")
+                sw.bind("<Button-1>", lambda e, k=i: self._edit_color(k))
+                t1 = tk.Label(row, font=(FONT, 9), width=18, anchor="w")
+                t1.pack(side="left", padx=6)
+                t2 = tk.Label(row, font=("Consolas", 8), fg="#888")
+                t2.pack(side="left")
+                for wdg in (row, sw, t1, t2):
+                    wdg.bind("<MouseWheel>", wheel)
+                self._swatch_rows.append((i, sw, t1, t2))
+        for i, sw, t1, t2 in self._swatch_rows:
+            sw.config(bg=self.colors[i])
+            t1.config(text=lg.short(i) if lg else "-")
+            t2.config(text=self.colors[i])
 
     def _edit_color(self, i: int):
         _, hx = colorchooser.askcolor(color=self.colors[i], parent=self, title=f"구간 {i + 1} 색상")
@@ -413,8 +444,12 @@ class App(tk.Tk):
         key = (ix, iy)
         if key in self._probe_cache:
             return self._probe_cache[key]
-        r = int(self.v_sample.get()) // 2
-        region = self.arr[max(0, iy - r):iy + r + 1, max(0, ix - r):ix + r + 1]
+        r0 = int(self.v_sample.get()) // 2
+        # 검은 선 위를 눌러도 인접한 색으로 판단하도록, 검은색뿐이면 샘플 영역을 조금씩 넓힌다
+        for r in range(r0, r0 + 7):
+            region = self.arr[max(0, iy - r):iy + r + 1, max(0, ix - r):ix + r + 1]
+            if not lg.black_mask(region).all():
+                break
         p = lg.classify(region)
         if self.v_interp.get() and p.idx is not None:
             try:
@@ -447,10 +482,13 @@ class App(tk.Tk):
             lo, hi = self.legend_range(p.idx)
             lines.append(f"구간 {p.idx + 1}/{len(self.colors)} ({lo} ~ {hi}) · 일치도 {p.confidence * 100:.0f}%")
             if p.kind == "interp":
-                lines.append(f"아래 경계 {p.d_lo:.1f}px · 위 경계 {p.d_hi:.1f}px 기준 선형 보간")
+                lines.append(f"아래 경계 {p.d_lo:.1f}px · 위 경계 {p.d_hi:.1f}px 기준 보간")
+            elif p.kind == "center":
+                lines.append("경계를 못 찾아 구간 중앙값으로 근사 (탐색 반경 확대)")
             elif p.kind == "open":
-                lines.append("최대/최소 밖의 값도 같은 색이라 보간할 수 없습니다")
-        lines.append(f"색상 거리 {p.distance:.1f}")
+                lines.append("최대/최소 밖 값도 같은 색이라 보간 불가")
+        if math.isfinite(p.distance):
+            lines.append(f"색상 거리 {p.distance:.1f}")
         self.res_info.set("\n".join(lines))
 
     def legend_range(self, i: int) -> tuple[str, str]:
@@ -635,6 +673,7 @@ class App(tk.Tk):
                 "colors": self.colors, "tolerance": self.v_tol.get(), "sample": self.v_sample.get(),
                 "open_ends": self.v_open.get(), "delay": self.v_delay.get(), "hover": self.v_hover.get(),
                 "interp": self.v_interp.get(), "search": self.v_search.get(),
+                "ignore_black": self.v_black.get(), "black_thr": self.v_black_thr.get(),
             })
         except (OSError, tk.TclError):
             pass

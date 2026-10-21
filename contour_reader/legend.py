@@ -54,7 +54,8 @@ class Probe:
 
 class Legend:
     def __init__(self, vmin: float, vmax: float, colors: list[str],
-                 tolerance: float = 40.0, open_ends: bool = True, unit: str = ""):
+                 tolerance: float = 40.0, open_ends: bool = True, unit: str = "",
+                 ignore_black: bool = True, black_threshold: float = 70.0):
         if vmax <= vmin:
             raise ValueError("최대값은 최소값보다 커야 합니다.")
         if len(colors) < 2:
@@ -64,6 +65,8 @@ class Legend:
         self.tolerance = tolerance
         self.open_ends = open_ends
         self.unit = unit
+        self.ignore_black = ignore_black
+        self.black_threshold = black_threshold
         self._palette = np.array([hex_to_rgb(c) for c in colors], dtype=float)
 
     @property
@@ -95,14 +98,23 @@ class Legend:
         step = (self.vmax - self.vmin) / self.n
         return self.vmin + step * (np.arange(self.n) + 0.5)
 
+    def black_mask(self, pixels: np.ndarray) -> np.ndarray:
+        """검은색(선/테두리) 픽셀 여부. 범례에 어두운 색이 있으면 그보다 낮게 제한."""
+        if not self.ignore_black:
+            return np.zeros(pixels.shape[:-1], dtype=bool)
+        limit = min(self.black_threshold, float(self._palette.max(axis=1).min()) - 1)
+        return pixels.max(axis=-1) <= limit
+
     def nearest(self, pixels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(...,3) RGB -> (가장 가까운 구간 번호, 색상 거리). 입력과 같은 앞 차원 shape."""
+        """(...,3) RGB -> (가장 가까운 구간 번호, 색상 거리). 검은색은 거리 무한대(판단 제외)."""
         px = pixels.reshape(-1, 3).astype(float)
         d = np.empty((len(px), self.n))
         for k in range(self.n):
             d[:, k] = np.sqrt(((px - self._palette[k]) ** 2).sum(axis=1))
         shape = pixels.shape[:-1]
-        return d.argmin(axis=1).reshape(shape), d.min(axis=1).reshape(shape)
+        dmin = d.min(axis=1)
+        dmin[self.black_mask(px)] = np.inf
+        return d.argmin(axis=1).reshape(shape), dmin.reshape(shape)
 
     def band_map(self, pixels: np.ndarray) -> np.ndarray:
         """구간 번호 배열. 허용오차를 넘는 픽셀은 -1."""
@@ -121,7 +133,8 @@ class Legend:
         ok = dmin <= self.tolerance
         med = tuple(int(v) for v in np.median(px, axis=0))
         if not ok.any():
-            return Probe(None, med, float(dmin.min()), 0.0, "범례 색상 아님 (배경/선/문자)", label="범례 외")
+            msg = "검은색(선)만 있음 — 판단 제외" if self.black_mask(px).all() else "범례 색상 아님 (배경/문자)"
+            return Probe(None, med, float(dmin.min()), 0.0, msg, label="범례 외")
         counts = np.bincount(idx[ok], minlength=self.n)
         best = int(counts.argmax())
         sel = ok & (idx == best)

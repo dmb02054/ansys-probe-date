@@ -78,4 +78,4 @@ def refine_probe(p: Probe, arr: np.ndarray, x: int, y: int, lg: Legend, radius: 
         p.value = (lo + hi) / 2
         p.kind = "center"
         p.label = f"~{p.value:.2f}"
-        p.text = f"≈ {p.value:.2f}{unit}  (경계 미탐지: 구간 중앙값)"
+        p.text = f"≈ {p.value:.2f}{unit}  (근사)"
