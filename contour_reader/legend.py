@@ -45,6 +45,11 @@ class Probe:
     confidence: float        # 샘플 영역 중 해당 구간 비율
     text: str                # 화면 표시용 값 문자열
     center: float | None = None
+    label: str = ""          # 마커 라벨용 짧은 값
+    value: float | None = None   # 보간된 단일 값
+    kind: str = "band"       # band(구간) | interp(보간) | center(경계 미탐지) | open(최대/최소 밖)
+    d_lo: float | None = None    # 아래/위 구간 경계까지의 거리(px)
+    d_hi: float | None = None
 
 
 class Legend:
@@ -116,13 +121,13 @@ class Legend:
         ok = dmin <= self.tolerance
         med = tuple(int(v) for v in np.median(px, axis=0))
         if not ok.any():
-            return Probe(None, med, float(dmin.min()), 0.0, "범례 색상 아님 (배경/선/문자)")
+            return Probe(None, med, float(dmin.min()), 0.0, "범례 색상 아님 (배경/선/문자)", label="범례 외")
         counts = np.bincount(idx[ok], minlength=self.n)
         best = int(counts.argmax())
         sel = ok & (idx == best)
         lo, hi = self.band_range(best)
         return Probe(best, med, float(dmin[sel].mean()), float(sel.sum() / len(px)),
-                     self.describe(best), (lo + hi) / 2)
+                     self.describe(best), (lo + hi) / 2, label=self.short(best))
 
 
 def sample_colors(arr: np.ndarray, box: tuple[int, int, int, int], n: int) -> list[str]:
