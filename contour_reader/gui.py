@@ -3,16 +3,29 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 
 from . import capture, settings
+from .drawing import SERIES_COLORS, render_chart
+from .export import ExportMarker, auto_offset, compose
 from .legend import (DEFAULT_COLORS, Legend, Probe, fmt, hex_to_rgb,
                      resample_colors, sample_colors)
+from .profile import direction_profiles, line_profile, radial_profile
 
 FONT = "Malgun Gothic"
+PROFILE_MODES = ["방사 평균 (전방향)", "방향별 (8방향)", "마커 간 직선"]
+
+
+@dataclass
+class Marker:
+    x: int
+    y: int
+    dx: float | None = None   # 라벨 좌상단의 마커 기준 오프셋(이미지 px). None=자동 배치
+    dy: float | None = None
 
 
 def _text_color(hex_color: str) -> str:
@@ -39,20 +52,36 @@ class App(tk.Tk):
         self.v_open = tk.BooleanVar(value=bool(cfg["open_ends"]))
         self.v_delay = tk.IntVar(value=int(cfg["delay"]))
         self.v_hover = tk.BooleanVar(value=bool(cfg["hover"]))
+        self.v_pmode = tk.StringVar(value=cfg["pmode"] if cfg["pmode"] in PROFILE_MODES else PROFILE_MODES[0])
+        self.v_radius = tk.IntVar(value=int(cfg["radius"]))
+        self.v_scale = tk.StringVar(value=str(cfg["scale"]))
+        self.v_scale_unit = tk.StringVar(value=cfg["scale_unit"])
+        self.v_target = tk.StringVar(value="")
+        self.v_save_chart = tk.BooleanVar(value=bool(cfg["save_chart"]))
 
         self.img: Image.Image | None = None
         self.arr: np.ndarray | None = None
         self.photo = None
+        self.chart_photo = None
+        self.chart_img: Image.Image | None = None
+        self.chart_caption = ""
+        self.profile_data: list[tuple] = []
         self.zoom, self.ox, self.oy = 1.0, 0.0, 0.0
-        self.markers: list[tuple[int, int]] = []
+        self.markers: list[Marker] = []
+        self.selected: int | None = None
         self.legend_mode = False
         self._press = None
+        self._drag_label = None
         self._drag_rect = None
 
+        self._label_boxes: dict[int, tuple] = {}
+        self._profile_table = None
         self._build_ui()
         self._bind_keys()
         for v in (self.v_min, self.v_max, self.v_unit, self.v_tol, self.v_sample, self.v_open):
             v.trace_add("write", lambda *_: self._on_legend_change())
+        for v in (self.v_pmode, self.v_radius, self.v_scale, self.v_scale_unit, self.v_target):
+            v.trace_add("write", lambda *_: self.update_profile())
         self._refresh_swatches()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -128,16 +157,37 @@ class App(tk.Tk):
                  justify="left", wraplength=250).grid(row=1, column=1, sticky="w")
 
         bf = ttk.Frame(left)
-        bf.pack(fill="x", pady=6)
+        bf.pack(fill="x", pady=(6, 0))
         ttk.Button(bf, text="마커 지우기", command=self.clear_markers).pack(side="left", expand=True, fill="x")
         ttk.Button(bf, text="결과 복사", command=self.copy_results).pack(side="left", expand=True, fill="x", padx=4)
         ttk.Button(bf, text="이미지 저장", command=self.save_image).pack(side="left", expand=True, fill="x")
+        ttk.Checkbutton(left, text="저장 시 선택 마커의 거리 프로파일 포함", variable=self.v_save_chart).pack(
+            anchor="w", pady=(2, 0))
 
-        # 캔버스
+        # 캔버스 + 프로파일 패널
         self.canvas = tk.Canvas(right, bg="#2b2b2b", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
+
+        pf = ttk.LabelFrame(right, text="거리별 값 프로파일 (선택한 마커 기준)", padding=4)
+        pf.pack(fill="x")
+        ctl = ttk.Frame(pf)
+        ctl.pack(fill="x")
+        ttk.Combobox(ctl, values=PROFILE_MODES, textvariable=self.v_pmode, state="readonly", width=18).pack(side="left")
+        ttk.Label(ctl, text="  반경(px)").pack(side="left")
+        ttk.Spinbox(ctl, from_=5, to=300, width=5, textvariable=self.v_radius).pack(side="left")
+        ttk.Label(ctl, text="  1px =").pack(side="left")
+        ttk.Entry(ctl, textvariable=self.v_scale, width=7).pack(side="left")
+        ttk.Entry(ctl, textvariable=self.v_scale_unit, width=4).pack(side="left", padx=(2, 0))
+        ttk.Label(ctl, text="  직선 대상").pack(side="left")
+        self.cb_target = ttk.Combobox(ctl, values=[], textvariable=self.v_target, state="readonly", width=5)
+        self.cb_target.pack(side="left")
+        ttk.Button(ctl, text="프로파일 복사", command=self.copy_profile).pack(side="right")
+        self.chart_canvas = tk.Canvas(pf, bg="white", height=230, highlightthickness=0)
+        self.chart_canvas.pack(fill="x", pady=(4, 0))
+        self.chart_canvas.bind("<Configure>", lambda e: self.update_profile())
+
         self.status = tk.StringVar(
-            value="좌클릭: 값 고정 마커 | 휠: 확대/축소 | 드래그 또는 우클릭 드래그: 이동 | Backspace: 마지막 마커 삭제")
+            value="좌클릭: 마커 추가/선택 | 라벨 드래그: 위치 이동 | 휠: 확대/축소 | 우클릭 드래그: 이동 | Backspace: 선택 마커 삭제")
         ttk.Label(right, textvariable=self.status, padding=4).pack(fill="x")
 
         c = self.canvas
@@ -172,6 +222,7 @@ class App(tk.Tk):
     def _on_legend_change(self):
         self._refresh_swatches()
         self.render()
+        self.update_profile()
 
     def _on_n_change(self):
         try:
@@ -201,8 +252,7 @@ class App(tk.Tk):
         _, hx = colorchooser.askcolor(color=self.colors[i], parent=self, title=f"구간 {i + 1} 색상")
         if hx:
             self.colors[i] = hx
-            self._refresh_swatches()
-            self.render()
+            self._on_legend_change()
 
     def reset_colors(self):
         self.colors = list(DEFAULT_COLORS)
@@ -227,10 +277,12 @@ class App(tk.Tk):
         self.img = img.convert("RGB")
         self.arr = np.asarray(self.img)
         self.markers.clear()
+        self.selected = None
         self.res_value.set("-")
         self.res_info.set("이미지를 클릭하면 값이 표시됩니다")
         self.res_swatch.config(bg=self.cget("bg"))
         self.fit()
+        self.update_profile()
         self.status.set(f"이미지 {self.img.width} x {self.img.height}px")
 
     def start_capture(self):
@@ -307,26 +359,60 @@ class App(tk.Tk):
             size = (max(1, round((ix1 - ix0) * z)), max(1, round((iy1 - iy0) * z)))
             crop = crop.resize(size, Image.NEAREST if z >= 1 else Image.BILINEAR)
             self.photo = ImageTk.PhotoImage(crop)
-            c.create_image((ix0 - self.ox) * z, (iy0 - self.oy) * z, anchor="nw", image=self.photo)
+            c.create_image((ix0 - self.ox) * z, (iy0 - self.oy) * z, anchor="nw", image=self.photo, tags="img")
+        self.draw_overlay()
 
-        lg = self._build_legend()
-        for n, (mx, my) in enumerate(self.markers, 1):
-            p = self._probe(mx, my, lg)
-            sx, sy = self._to_canvas(mx + 0.5, my + 0.5)
-            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, outline="white", width=4)
-            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, outline="#e00000", width=2)
-            c.create_line(sx - 12, sy, sx + 12, sy, fill="#e00000")
-            c.create_line(sx, sy - 12, sx, sy + 12, fill="#e00000")
-            self._label(sx, sy, [f"#{n}  ({mx}, {my})", p.text if p else "-"], p, "marker")
-
-    def _label(self, sx, sy, lines, probe: Probe | None, tag):
+    def draw_overlay(self):
+        """마커/라벨/연결선만 다시 그린다 (라벨 드래그 시 빠른 갱신)."""
         c = self.canvas
-        border = "#e00000"
-        if probe and probe.idx is not None:
-            border = self.colors[probe.idx]
-        text = "\n".join(lines)
+        c.delete("ov", "hover")
+        if self.img is None:
+            return
+        lg = self._build_legend()
+        unit = f" {lg.unit}" if lg and lg.unit else ""
+        cw, ch = max(1, c.winfo_width()), max(1, c.winfo_height())
+        self._label_boxes = {}
+        for i, m in enumerate(self.markers):
+            p = self._probe(m.x, m.y, lg)
+            sx, sy = self._to_canvas(m.x + 0.5, m.y + 0.5)
+            sel = i == self.selected
+            border = self.colors[p.idx] if p and p.idx is not None else "#e00000"
+            short = (lg.short(p.idx) if p.idx is not None else "범례 외") if (p and lg) else "-"
+            tag = f"lbl{i}"
+            t = c.create_text(0, 0, text=f"#{i + 1}  {short}{unit}", anchor="nw", font=(FONT, 11, "bold"))
+            x0, y0, x1, y1 = c.bbox(t)
+            c.delete(t)
+            chip, pad = 14, 6
+            bw, bh = pad * 2 + chip + 6 + (x1 - x0), max(chip, y1 - y0) + pad * 2
+            if m.dx is None:
+                dx, dy = auto_offset(bw, bh, cw, ch, sx, sy, 16)
+            else:
+                dx, dy = m.dx * self.zoom, m.dy * self.zoom
+            bx, by = sx + dx, sy + dy
+            self._label_boxes[i] = (bx, by, bw, bh)
+            nx, ny = min(max(sx, bx), bx + bw), min(max(sy, by), by + bh)
+            if (nx, ny) != (sx, sy):
+                c.create_line(sx, sy, nx, ny, fill="white", width=4, tags="ov")
+                c.create_line(sx, sy, nx, ny, fill="#333333", width=2, tags="ov")
+            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, outline="white", width=4, tags="ov")
+            c.create_oval(sx - 7, sy - 7, sx + 7, sy + 7, outline="#ff1744" if sel else "#e00000", width=3 if sel else 2,
+                          tags="ov")
+            c.create_line(sx - 12, sy, sx + 12, sy, fill="#e00000", tags="ov")
+            c.create_line(sx, sy - 12, sx, sy + 12, fill="#e00000", tags="ov")
+            c.create_rectangle(bx - 2, by - 2, bx + bw + 2, by + bh + 2, fill="white", outline="white", tags=("ov", tag))
+            c.create_rectangle(bx, by, bx + bw, by + bh, fill="white", outline=border, width=4 if sel else 3,
+                               tags=("ov", tag))
+            cy = by + bh / 2
+            c.create_rectangle(bx + pad, cy - chip / 2, bx + pad + chip, cy + chip / 2, fill=border if p and p.idx is not None
+                               else "#cccccc", outline="#555555", tags=("ov", tag))
+            c.create_text(bx + pad + chip + 6, cy, text=f"#{i + 1}  {short}{unit}", anchor="w",
+                          font=(FONT, 11, "bold"), fill="#111111", tags=("ov", tag))
+
+    def _tooltip(self, sx, sy, text, probe: Probe | None):
+        c = self.canvas
+        border = self.colors[probe.idx] if probe and probe.idx is not None else "#e00000"
         t = c.create_text(sx + 14, sy - 14, text=text, anchor="sw", font=(FONT, 11, "bold"),
-                          fill="black", justify="left", tags=tag)
+                          fill="black", tags="hover")
         x0, y0, x1, y1 = c.bbox(t)
         dx = dy = 0
         if x1 + 6 > c.winfo_width():
@@ -336,8 +422,8 @@ class App(tk.Tk):
         if dx or dy:
             c.move(t, dx, dy)
             x0, y0, x1, y1 = c.bbox(t)
-        r = c.create_rectangle(x0 - 6, y0 - 4, x1 + 6, y1 + 4, fill="#fffde7", outline="white", width=5, tags=tag)
-        r2 = c.create_rectangle(x0 - 6, y0 - 4, x1 + 6, y1 + 4, outline=border, width=3, tags=tag)
+        r = c.create_rectangle(x0 - 6, y0 - 4, x1 + 6, y1 + 4, fill="#fffde7", outline="white", width=5, tags="hover")
+        r2 = c.create_rectangle(x0 - 6, y0 - 4, x1 + 6, y1 + 4, outline=border, width=3, tags="hover")
         c.tag_lower(r2, t)
         c.tag_lower(r, r2)
 
@@ -378,10 +464,23 @@ class App(tk.Tk):
         self._show_result(ix, iy, p)
         if p:
             short = lg.short(p.idx) if p.idx is not None else "범례 외"
-            self._label(e.x, e.y, [short], p, "hover")
+            self._tooltip(e.x, e.y, short, p)
 
     def _on_press(self, e):
         self._press = (e.x, e.y, self.ox, self.oy, False)
+        self._drag_label = None
+        if self.img is None or self.legend_mode:
+            return
+        for it in reversed(self.canvas.find_overlapping(e.x, e.y, e.x, e.y)):
+            tag = next((t for t in self.canvas.gettags(it) if t.startswith("lbl")), None)
+            if tag:
+                i = int(tag[3:])
+                bx, by, _, _ = self._label_boxes[i]
+                sx, sy = self._to_canvas(self.markers[i].x + 0.5, self.markers[i].y + 0.5)
+                self._drag_label = (i, e.x, e.y, bx - sx, by - sy)
+                if self.selected != i:
+                    self.select(i)
+                return
 
     def _on_drag(self, e):
         if not self._press:
@@ -390,7 +489,12 @@ class App(tk.Tk):
         if not moved and math.hypot(e.x - sx, e.y - sy) < 4:
             return
         self._press = (sx, sy, ox, oy, True)
-        if self.legend_mode:
+        if self._drag_label is not None:
+            i, px, py, off_x, off_y = self._drag_label
+            self.markers[i].dx = (off_x + e.x - px) / self.zoom
+            self.markers[i].dy = (off_y + e.y - py) / self.zoom
+            self.draw_overlay()
+        elif self.legend_mode:
             self.canvas.delete("legendbox")
             self.canvas.create_rectangle(sx, sy, e.x, e.y, outline="#00e5ff", width=2, dash=(4, 2), tags="legendbox")
         elif self.img is not None:
@@ -404,18 +508,39 @@ class App(tk.Tk):
             return
         sx, sy, _, _, moved = self._press
         self._press = None
+        if self._drag_label is not None:
+            self._drag_label = None
+            return
         if self.legend_mode:
             if moved:
                 self._extract_legend(sx, sy, e.x, e.y)
             return
         if moved:
             return
+        hit = self._hit_marker(e.x, e.y)
+        if hit is not None:
+            self.select(hit)
+            return
         fx, fy = self._to_img(e.x, e.y)
         ix, iy = int(math.floor(fx)), int(math.floor(fy))
         if 0 <= ix < self.img.width and 0 <= iy < self.img.height:
-            self.markers.append((ix, iy))
-            self._show_result(ix, iy, self._probe(ix, iy, self._build_legend()))
-            self.render()
+            self.markers.append(Marker(ix, iy))
+            self.select(len(self.markers) - 1)
+
+    def _hit_marker(self, cx, cy) -> int | None:
+        for i in range(len(self.markers) - 1, -1, -1):
+            sx, sy = self._to_canvas(self.markers[i].x + 0.5, self.markers[i].y + 0.5)
+            if math.hypot(cx - sx, cy - sy) <= 10:
+                return i
+        return None
+
+    def select(self, i: int | None):
+        self.selected = i
+        if i is not None:
+            m = self.markers[i]
+            self._show_result(m.x, m.y, self._probe(m.x, m.y, self._build_legend()))
+        self.draw_overlay()
+        self.update_profile()
 
     def _extract_legend(self, cx0, cy0, cx1, cy1):
         a, b = self._to_img(cx0, cy0), self._to_img(cx1, cy1)
@@ -454,19 +579,19 @@ class App(tk.Tk):
     # ----------------------------------------------------------- markers
     def clear_markers(self):
         self.markers.clear()
-        self.render()
+        self.select(None)
 
     def _pop_marker(self):
         if self.markers and isinstance(self.focus_get(), (tk.Canvas, tk.Tk)):
-            self.markers.pop()
-            self.render()
+            self.markers.pop(self.selected if self.selected is not None else -1)
+            self.select(len(self.markers) - 1 if self.markers else None)
 
     def _marker_lines(self):
         lg = self._build_legend()
         out = []
-        for n, (x, y) in enumerate(self.markers, 1):
-            p = self._probe(x, y, lg)
-            out.append((n, x, y, p.text if p else "-"))
+        for n, m in enumerate(self.markers, 1):
+            p = self._probe(m.x, m.y, lg)
+            out.append((n, m.x, m.y, p.text if p else "-"))
         return out
 
     def copy_results(self):
@@ -480,23 +605,117 @@ class App(tk.Tk):
     def save_image(self):
         if self.img is None:
             return
+        lg = self._build_legend(quiet=False)
+        if lg is None:
+            return
         p = filedialog.asksaveasfilename(parent=self, defaultextension=".png", filetypes=[("PNG", "*.png")])
         if not p:
             return
-        im = self.img.copy()
-        d = ImageDraw.Draw(im)
-        try:
-            font = ImageFont.truetype("malgun.ttf", 14)
-        except OSError:
-            font = ImageFont.load_default()
-        for n, x, y, t in self._marker_lines():
-            d.ellipse((x - 6, y - 6, x + 6, y + 6), outline="red", width=2)
-            label = f"#{n} {t}"
-            bb = d.textbbox((x + 10, y - 22), label, font=font)
-            d.rectangle((bb[0] - 3, bb[1] - 2, bb[2] + 3, bb[3] + 2), fill="#fffde7", outline="red")
-            d.text((x + 10, y - 22), label, fill="black", font=font)
-        im.save(p)
+        items = []
+        for i, m in enumerate(self.markers):
+            pr = self._probe(m.x, m.y, lg)
+            short = (lg.short(pr.idx) if pr.idx is not None else "범례 외") if pr else "-"
+            items.append(ExportMarker(i + 1, m.x, m.y, pr.text if pr else "-", short,
+                                      self.colors[pr.idx] if pr and pr.idx is not None else None,
+                                      None if m.dx is None else (m.dx, m.dy)))
+        chart_fn, caption = None, ""
+        if self.v_save_chart.get():
+            spec = self._profile_spec(lg)
+            if isinstance(spec, dict):
+                def chart_fn(size, scale, spec=spec):
+                    return render_chart(spec["series"], lg, spec["xlabel"], size, "", spec["band"], scale)
+                caption = spec["title"]
+        compose(self.img, items, lg, chart_fn, caption,
+                None if self.selected is None else self.selected + 1).save(p)
         self.status.set(f"저장됨: {p}")
+
+    # ----------------------------------------------------------- profile
+    def _profile_spec(self, lg: Legend) -> dict | str:
+        """선택 마커의 프로파일 정의. 불가능하면 안내 문자열."""
+        if self.img is None or self.selected is None or not self.markers:
+            return "마커를 클릭하면 주변 색상으로 거리별 값 변화를 보여줍니다"
+        try:
+            radius = min(300, max(5, int(self.v_radius.get())))
+        except (ValueError, tk.TclError):
+            radius = 60
+        try:
+            scale = float(self.v_scale.get())
+            if scale <= 0:
+                raise ValueError
+            unit = self.v_scale_unit.get().strip() or "단위"
+        except ValueError:
+            scale, unit = 1.0, "px"
+        xlabel = f"중심으로부터 거리 ({unit})"
+        m = self.markers[self.selected]
+        n = self.selected + 1
+        mode = self.v_pmode.get()
+        band = None
+        if mode == PROFILE_MODES[0]:
+            d = radial_profile(self.arr, m.x, m.y, radius, lg)
+            xs = d["xs"] * scale
+            series = [{"label": "평균", "color": "#1565c0", "xs": xs, "ys": d["mean"], "width": 2.5}]
+            band = {"xs": xs, "lo": d["min"], "hi": d["max"]}
+            title = f"#{n} 주변 거리별 값 (선: 평균, 음영: 최소~최대)"
+            header = ["거리", "평균", "최소", "최대"]
+            cols = [xs, d["mean"], d["min"], d["max"]]
+        elif mode == PROFILE_MODES[1]:
+            dirs = direction_profiles(self.arr, m.x, m.y, radius, lg)
+            xs = dirs[0][1] * scale
+            series = [{"label": name, "color": SERIES_COLORS[k % len(SERIES_COLORS)], "xs": dx * scale, "ys": ys,
+                       "width": 1.8} for k, (name, dx, ys) in enumerate(dirs)]
+            title = f"#{n} 방향별 거리-값"
+            header = ["거리"] + [name for name, _, _ in dirs]
+            cols = [xs] + [ys for _, _, ys in dirs]
+        else:
+            if len(self.markers) < 2:
+                return "'마커 간 직선'은 마커가 2개 이상 필요합니다"
+            options = [f"#{k + 1}" for k in range(len(self.markers)) if k != self.selected]
+            tgt = self.v_target.get()
+            t = int(tgt[1:]) - 1 if tgt in options else (self.selected + 1) % len(self.markers)
+            o = self.markers[t]
+            xs, ys = line_profile(self.arr, (m.x, m.y), (o.x, o.y), lg)
+            xs = xs * scale
+            series = [{"label": f"#{n}→#{t + 1}", "color": "#c62828", "xs": xs, "ys": ys, "width": 2.5}]
+            title = f"#{n} → #{t + 1} 직선 거리-값"
+            header = ["거리", "값"]
+            cols = [xs, ys]
+        return {"series": series, "band": band, "xlabel": xlabel, "title": title, "header": header, "cols": cols}
+
+    def update_profile(self):
+        c = self.chart_canvas
+        c.delete("all")
+        self.chart_photo = None
+        self._profile_table = None
+        # 직선 모드의 대상 선택지 갱신
+        options = [f"#{k + 1}" for k in range(len(self.markers)) if k != self.selected]
+        if list(self.cb_target.cget("values")) != options:
+            self.cb_target.config(values=options)
+        if options and self.v_target.get() not in options:
+            self.v_target.set(options[0] if self.selected is None else options[min(self.selected, len(options) - 1)])
+            return  # 변수 변경 트레이스가 다시 update_profile 을 호출
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 60 or h < 60:
+            return
+        lg = self._build_legend()
+        spec = self._profile_spec(lg) if lg else "범례 최소/최대값을 확인하세요"
+        if isinstance(spec, str):
+            c.create_text(w // 2, h // 2, text=spec, fill="#888", font=(FONT, 11))
+            return
+        self._profile_table = (spec["header"], spec["cols"])
+        img = render_chart(spec["series"], lg, spec["xlabel"], (w, h), spec["title"], spec["band"])
+        self.chart_photo = ImageTk.PhotoImage(img)
+        c.create_image(0, 0, anchor="nw", image=self.chart_photo)
+
+    def copy_profile(self):
+        if not self._profile_table:
+            return
+        header, cols = self._profile_table
+        lines = ["\t".join(header)]
+        for row in zip(*cols):
+            lines.append("\t".join("" if not np.isfinite(v) else f"{v:.4g}" for v in row))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.status.set("프로파일 데이터를 클립보드에 복사했습니다 (엑셀에 붙여넣기 가능).")
 
     # ------------------------------------------------------------- close
     def _on_close(self):
@@ -505,6 +724,8 @@ class App(tk.Tk):
                 "vmin": self.v_min.get(), "vmax": self.v_max.get(), "unit": self.v_unit.get(),
                 "colors": self.colors, "tolerance": self.v_tol.get(), "sample": self.v_sample.get(),
                 "open_ends": self.v_open.get(), "delay": self.v_delay.get(), "hover": self.v_hover.get(),
+                "pmode": self.v_pmode.get(), "radius": self.v_radius.get(), "scale": self.v_scale.get(),
+                "scale_unit": self.v_scale_unit.get(), "save_chart": self.v_save_chart.get(),
             })
         except (OSError, tk.TclError):
             pass

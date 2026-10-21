@@ -18,6 +18,11 @@ DEFAULTS = {
     "open_ends": True,
     "delay": 0,
     "hover": True,
+    "pmode": "방사 평균 (전방향)",
+    "radius": 60,
+    "scale": "",
+    "scale_unit": "mm",
+    "save_chart": True,
 }
 
 

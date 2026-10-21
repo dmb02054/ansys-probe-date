@@ -86,12 +86,33 @@ class Legend:
             return f"≤ {fmt(hi)}"
         return f"{fmt(lo)} ~ {fmt(hi)}"
 
+    def centers(self) -> np.ndarray:
+        step = (self.vmax - self.vmin) / self.n
+        return self.vmin + step * (np.arange(self.n) + 0.5)
+
+    def nearest(self, pixels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(...,3) RGB -> (가장 가까운 구간 번호, 색상 거리). 입력과 같은 앞 차원 shape."""
+        px = pixels.reshape(-1, 3).astype(float)
+        d = np.empty((len(px), self.n))
+        for k in range(self.n):
+            d[:, k] = np.sqrt(((px - self._palette[k]) ** 2).sum(axis=1))
+        shape = pixels.shape[:-1]
+        return d.argmin(axis=1).reshape(shape), d.min(axis=1).reshape(shape)
+
+    def band_map(self, pixels: np.ndarray) -> np.ndarray:
+        """구간 번호 배열. 허용오차를 넘는 픽셀은 -1."""
+        idx, dmin = self.nearest(pixels)
+        return np.where(dmin <= self.tolerance, idx, -1)
+
+    def value_map(self, pixels: np.ndarray) -> np.ndarray:
+        """구간 중앙값 배열. 범례 색상이 아닌 픽셀은 NaN."""
+        idx = self.band_map(pixels)
+        return np.where(idx >= 0, self.centers()[np.maximum(idx, 0)], np.nan)
+
     def classify(self, pixels: np.ndarray) -> Probe:
         """pixels: (N,3) RGB. 허용오차 내 픽셀들의 다수결로 구간 결정."""
         px = pixels.reshape(-1, 3).astype(float)
-        d = np.linalg.norm(px[:, None, :] - self._palette[None, :, :], axis=2)
-        idx = d.argmin(axis=1)
-        dmin = d.min(axis=1)
+        idx, dmin = self.nearest(px)
         ok = dmin <= self.tolerance
         med = tuple(int(v) for v in np.median(px, axis=0))
         if not ok.any():
