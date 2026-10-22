@@ -1,14 +1,15 @@
-"""마커가 표시된 이미지를 라벨까지 포함해 흰 배경으로 합성."""
+"""마커가 표시된 이미지를 라벨까지 포함해 흰 배경 PNG 로 합성한다 (이미지 저장 기능)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from PIL import Image, ImageDraw, ImageFont
 
-_FONTS: dict[int, ImageFont.ImageFont] = {}
+_FONTS: dict[int, ImageFont.ImageFont] = {}   # 글꼴 크기별 캐시
 
 
 def get_font(size: float) -> ImageFont.ImageFont:
+    """한글이 나오는 글꼴을 찾아 반환한다 (맑은 고딕 -> 나눔고딕 -> Arial -> 기본 글꼴)."""
     size = max(6, int(round(size)))
     if size not in _FONTS:
         font = None
@@ -24,6 +25,7 @@ def get_font(size: float) -> ImageFont.ImageFont:
 
 @dataclass
 class ExportMarker:
+    """저장 이미지에 그릴 마커 한 개."""
     n: int
     x: int
     y: int
@@ -44,14 +46,16 @@ def auto_offset(bw: float, bh: float, width: float, height: float, x: float, y: 
 
 def compose(img: Image.Image, markers: list[ExportMarker], unit: str = "",
             selected: int | None = None) -> Image.Image:
-    """이미지 밖으로 옮긴 라벨도 잘리지 않도록 캔버스를 넓히고 배경은 흰색으로 통일."""
+    """이미지 밖으로 옮긴 라벨도 잘리지 않도록 캔버스를 넓히고 배경은 흰색으로 통일한다."""
+    # 작은 이미지는 2배로 키워 글자와 선이 또렷하게 보이게 한다
     s = 2 if max(img.size) < 600 else 1
     base = img.resize((img.width * s, img.height * s), Image.NEAREST) if s > 1 else img
     W, H = base.size
     font = get_font(15 * s)
-    chip, pad = 14 * s, 7 * s
-    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    chip, pad = 14 * s, 7 * s   # 라벨 안의 색상 칩 크기 / 안쪽 여백
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))   # 글자 크기 측정용 임시 캔버스
 
+    # 1단계: 각 라벨의 크기와 위치를 계산
     boxes = []
     for m in markers:
         text = f"#{m.n}  {m.label}" + (f" {unit}" if unit and m.color is not None else "")
@@ -64,29 +68,33 @@ def compose(img: Image.Image, markers: list[ExportMarker], unit: str = "",
             dx, dy = m.offset[0] * s, m.offset[1] * s
         boxes.append((m, text, mx, my, mx + dx, my + dy, bw, bh))
 
+    # 2단계: 모든 라벨이 들어가도록 최종 캔버스 영역을 계산하고 흰 배경에 원본 이미지를 붙인다
     margin = 14 * s
     left = min([0] + [b[4] for b in boxes]) - margin
     top = min([0] + [b[5] for b in boxes]) - margin
     right = max([W] + [b[4] + b[6] for b in boxes]) + margin
     bottom = max([H] + [b[5] + b[7] for b in boxes]) + margin
-    ox, oy = round(-left), round(-top)
+    ox, oy = round(-left), round(-top)   # 원본 이미지가 놓일 위치
     out = Image.new("RGB", (round(right - left), round(bottom - top)), "white")
     out.paste(base, (ox, oy))
     d = ImageDraw.Draw(out)
     d.rectangle((ox - 1, oy - 1, ox + W, oy + H), outline="#bbbbbb")
 
+    # 3단계: 마커와 라벨을 연결하는 선 (흰 테두리 + 어두운 선으로 어떤 배경에서도 보이게)
     for m, text, mx, my, bx, by, bw, bh in boxes:
         mx, my, bx, by = mx + ox, my + oy, bx + ox, by + oy
-        cx, cy = min(max(mx, bx), bx + bw), min(max(my, by), by + bh)
+        cx, cy = min(max(mx, bx), bx + bw), min(max(my, by), by + bh)   # 라벨 박스에서 마커와 가장 가까운 점
         if (cx, cy) != (mx, my):
             d.line((mx, my, cx, cy), fill="white", width=4 * s)
             d.line((mx, my, cx, cy), fill="#333333", width=2 * s)
+    # 4단계: 마커(원 + 십자선)
     for m, text, mx, my, *_ in boxes:
         mx, my, r = mx + ox, my + oy, 7 * s
         d.ellipse((mx - r, my - r, mx + r, my + r), outline="white", width=4 * s)
         d.ellipse((mx - r, my - r, mx + r, my + r), outline="#e00000", width=2 * s)
         d.line((mx - r - 4 * s, my, mx + r + 4 * s, my), fill="#e00000", width=s)
         d.line((mx, my - r - 4 * s, mx, my + r + 4 * s), fill="#e00000", width=s)
+    # 5단계: 라벨 박스(구간 색 테두리 + 색상 칩 + 값 문자열). 선택된 마커는 테두리를 굵게
     for m, text, _, _, bx, by, bw, bh in boxes:
         bx, by = bx + ox, by + oy
         d.rounded_rectangle((bx, by, bx + bw, by + bh), radius=6 * s, fill="#ffffff",
