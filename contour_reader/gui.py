@@ -4,8 +4,9 @@ from __future__ import annotations
 import math
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox
 
+import customtkinter as ctk
 import numpy as np
 from PIL import Image, ImageGrab, ImageTk
 
@@ -16,6 +17,8 @@ from .legend import (DEFAULT_COLORS, Legend, Probe, fmt, hex_to_rgb,
                      resample_colors, sample_colors)
 
 FONT = "Malgun Gothic"
+ACCENT = "#3b82f6"
+GRAY_BTN = "#6b7280"
 
 
 @dataclass
@@ -31,13 +34,15 @@ def _text_color(hex_color: str) -> str:
     return "#000000" if (r * 299 + g * 587 + b * 114) / 1000 > 140 else "#ffffff"
 
 
-class App(tk.Tk):
+class App(ctk.CTk):
     def __init__(self):
         capture.enable_dpi_awareness()
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
         super().__init__()
         self.title("컨투어 값 판독기")
-        self.geometry("1280x860")
-        self.minsize(960, 840)
+        self.geometry("980x640")
+        self.minsize(820, 560)
 
         cfg = settings.load()
         self.colors: list[str] = list(cfg["colors"])
@@ -54,7 +59,9 @@ class App(tk.Tk):
         self.v_search = tk.IntVar(value=int(cfg["search"]))
         self.v_black = tk.BooleanVar(value=bool(cfg["ignore_black"]))
         self.v_black_thr = tk.IntVar(value=int(cfg["black_thr"]))
-
+        self.v_shade = tk.IntVar(value=int(cfg["shade"]))
+        self.edge_vars: list[tk.StringVar] = []
+        self._saved_edges: dict | None = cfg.get("edges") or {}
         self.img: Image.Image | None = None
         self.arr: np.ndarray | None = None
         self.photo = None
@@ -72,115 +79,145 @@ class App(tk.Tk):
         self._build_ui()
         self._bind_keys()
         for v in (self.v_min, self.v_max, self.v_unit, self.v_tol, self.v_sample, self.v_open,
-                  self.v_interp, self.v_search, self.v_black, self.v_black_thr):
+                  self.v_interp, self.v_search, self.v_black, self.v_black_thr, self.v_shade):
             v.trace_add("write", lambda *_: self._on_legend_change())
         self._refresh_swatches()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------- UI
+    def _btn(self, parent, text, cmd, **kw):
+        return ctk.CTkButton(parent, text=text, command=cmd, height=26, font=self.f_s, **kw)
+
+    def _check(self, parent, text, var):
+        return ctk.CTkCheckBox(parent, text=text, variable=var, font=self.f_s, checkbox_width=18,
+                               checkbox_height=18, border_width=2)
+
+    def _field(self, parent, text, var, width=44):
+        ctk.CTkLabel(parent, text=text, font=self.f_s).pack(side="left")
+        ctk.CTkEntry(parent, textvariable=var, width=width, height=24, font=self.f_s,
+                     justify="center").pack(side="left", padx=(4, 10))
+
+    def _slider_row(self, parent, text, var, lo, hi):
+        r = ctk.CTkFrame(parent, fg_color="transparent")
+        r.pack(fill="x", pady=1)
+        ctk.CTkLabel(r, text=text, font=self.f_s, width=84, anchor="w").pack(side="left")
+        val = ctk.CTkLabel(r, text=str(var.get()), font=self.f_s, width=28)
+        val.pack(side="right")
+
+        def on(v):
+            var.set(int(round(v)))
+            val.configure(text=str(int(round(v))))
+        s = ctk.CTkSlider(r, from_=lo, to=hi, number_of_steps=hi - lo, height=14, command=on)
+        s.set(var.get())
+        s.pack(side="left", fill="x", expand=True, padx=4)
+
     def _build_ui(self):
-        left = ttk.Frame(self, padding=8, width=350)
+        self.f_s = ctk.CTkFont(family=FONT, size=12)
+        self.f_b = ctk.CTkFont(family=FONT, size=13, weight="bold")
+        left = ctk.CTkFrame(self, width=270, corner_radius=0)
         left.pack(side="left", fill="y")
         left.pack_propagate(False)   # 내용 길이가 바뀌어도 좌측 패널 크기가 흔들리지 않게 고정
-        right = ttk.Frame(self)
+        right = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
 
+        # 아래쪽 고정 영역 (먼저 pack 해야 창이 작아져도 잘리지 않음)
+        bf = ctk.CTkFrame(left, fg_color="transparent")
+        bf.pack(side="bottom", fill="x", padx=8, pady=(4, 8))
+        for text, cmd in (("마커 지우기", self.clear_markers), ("결과 복사", self.copy_results),
+                          ("이미지 저장", self.save_image)):
+            self._btn(bf, text, cmd, fg_color=GRAY_BTN, hover_color="#4b5563", width=60).pack(
+                side="left", expand=True, fill="x", padx=2)
+        self._opt_open = False
+        self.btn_opt = ctk.CTkButton(left, text="⚙ 판독 옵션  ▾", command=self._toggle_options, height=26,
+                                     font=self.f_s, fg_color="transparent", text_color="#374151",
+                                     hover_color="#e5e7eb", border_width=1, border_color="#9ca3af")
+        self.btn_opt.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
+
+        # 판독 옵션 (더보기로 펼침)
+        f = self.opt_frame = ctk.CTkFrame(left, fg_color="#f3f4f6")
+        self._slider_row(f, "색상 허용오차", self.v_tol, 5, 120)
+        self._slider_row(f, "그림자/조명 보정", self.v_shade, 0, 100)
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.pack(fill="x", pady=2)
+        ctk.CTkLabel(r, text="샘플(px)", font=self.f_s).pack(side="left")
+        self._sample_menu = ctk.CTkOptionMenu(r, values=["1", "3", "5", "7", "9", "15"], width=56, height=24,
+                                              font=self.f_s, dropdown_font=self.f_s,
+                                              command=lambda s: self.v_sample.set(int(s)))
+        self._sample_menu.set(str(self.v_sample.get()))
+        self._sample_menu.pack(side="left", padx=(4, 10))
+        self._field(r, "탐색반경", self.v_search)
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.pack(fill="x", pady=2)
+        self._field(r, "캡처 지연(초)", self.v_delay)
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.pack(fill="x", pady=2)
+        self._check(r, "검은선 무시", self.v_black).pack(side="left")
+        self._field(r, "임계", self.v_black_thr)
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.pack(fill="x", pady=2)
+        self._check(r, "소수 보간", self.v_interp).pack(side="left", padx=(0, 10))
+        self._check(r, "실시간 값", self.v_hover).pack(side="left")
+        r = ctk.CTkFrame(f, fg_color="transparent")
+        r.pack(fill="x", pady=(2, 6))
+        self._check(r, "양 끝 구간을 이상/이하로 표시", self.v_open).pack(side="left")
+
         # 이미지 입력
-        f = ttk.LabelFrame(left, text="1. 이미지 가져오기", padding=6)
-        f.pack(fill="x")
-        ttk.Button(f, text="화면 영역 캡처 (F2)", command=self.start_capture).grid(
-            row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(f, text="캡처 지연(초)").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Spinbox(f, from_=0, to=10, width=5, textvariable=self.v_delay).grid(row=1, column=1, sticky="e")
-        ttk.Button(f, text="파일 열기 (Ctrl+O)", command=self.open_file).grid(row=2, column=0, sticky="ew")
-        ttk.Button(f, text="클립보드 붙여넣기 (Ctrl+V)", command=self.paste).grid(row=2, column=1, sticky="ew")
-        f.columnconfigure((0, 1), weight=1)
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(8, 4))
+        for text, cmd in (("캡처 F2", self.start_capture), ("열기", self.open_file), ("붙여넣기", self.paste)):
+            self._btn(row, text, cmd, width=60).pack(side="left", expand=True, fill="x", padx=2)
 
-        # 범례 값
-        f = ttk.LabelFrame(left, text="2. 범례 값 입력", padding=6)
-        f.pack(fill="x", pady=6)
-        ttk.Label(f, text="최소값").grid(row=0, column=0, sticky="w")
-        ttk.Entry(f, textvariable=self.v_min, width=10).grid(row=0, column=1, padx=4)
-        ttk.Label(f, text="최대값").grid(row=0, column=2, sticky="w")
-        ttk.Entry(f, textvariable=self.v_max, width=10).grid(row=0, column=3, padx=4)
-        ttk.Label(f, text="단위").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Entry(f, textvariable=self.v_unit, width=10).grid(row=1, column=1, padx=4)
-        ttk.Label(f, text="구간 수").grid(row=1, column=2, sticky="w")
-        ttk.Spinbox(f, from_=2, to=30, width=8, textvariable=self.v_n,
-                    command=self._on_n_change).grid(row=1, column=3, padx=4)
-        ttk.Checkbutton(f, text="양 끝 구간을 '이상/이하'로 표시", variable=self.v_open).grid(
-            row=2, column=0, columnspan=4, sticky="w")
+        # 단위 / 구간 수
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=2)
+        self._field(row, "단위", self.v_unit, width=52)
+        ctk.CTkLabel(row, text="구간 수", font=self.f_s).pack(side="left")
+        self.n_menu = ctk.CTkOptionMenu(row, values=[str(i) for i in range(2, 31)], width=56, height=24,
+                                        font=self.f_s, dropdown_font=self.f_s, command=self._on_n_menu)
+        self.n_menu.set(str(self.v_n.get()))
+        self.n_menu.pack(side="left", padx=4)
 
-        # 범례 색상
-        f = ttk.LabelFrame(left, text="3. 범례 색상 (위=최대)", padding=6)
-        f.pack(fill="x")
-        box = ttk.Frame(f, height=150)
-        box.pack(fill="x")
-        box.pack_propagate(False)
-        self.swatch_canvas = tk.Canvas(box, highlightthickness=0, height=150)
-        sb = ttk.Scrollbar(box, command=self.swatch_canvas.yview)
-        self.swatch_canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.swatch_canvas.pack(side="left", fill="both", expand=True)
-        self.swatch_frame = ttk.Frame(self.swatch_canvas)
-        self.swatch_canvas.create_window((0, 0), window=self.swatch_frame, anchor="nw")
-        self.swatch_frame.bind("<Configure>", lambda e: self.swatch_canvas.configure(
-            scrollregion=self.swatch_canvas.bbox("all")))
+        # 범례 값 / 색상: 칸에 경계값을 입력(비우면 자동 보간), 색상칸 클릭=색 수정
+        ctk.CTkLabel(left, text="범례 값 · 색상 (위=최대)", font=self.f_s, text_color="#6b7280",
+                     anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+        bf = ctk.CTkFrame(left, fg_color="transparent")
+        bf.pack(side="bottom", fill="x", padx=8, pady=(4, 0))
+        self.btn_pick = self._btn(bf, "범례 추출", self.toggle_legend_mode, width=60)
+        self.btn_pick.pack(side="left", expand=True, fill="x", padx=2)
+        self._btn(bf, "기본 색", self.reset_colors, width=60, fg_color=GRAY_BTN,
+                  hover_color="#4b5563").pack(side="left", expand=True, fill="x", padx=2)
+        self._btn(bf, "값 비우기", self.clear_edges, width=60, fg_color=GRAY_BTN,
+                  hover_color="#4b5563").pack(side="left", expand=True, fill="x", padx=2)
+        self.swatch_frame = ctk.CTkScrollableFrame(left, height=230, fg_color="transparent")
+        self.swatch_frame.pack(fill="both", expand=True, padx=4, pady=2)
         self._swatch_rows: list[tuple] = []
-        bf = ttk.Frame(f)
-        bf.pack(fill="x", pady=(6, 0))
-        self.btn_pick = ttk.Button(bf, text="이미지에서 범례 추출", command=self.toggle_legend_mode)
-        self.btn_pick.pack(side="left", expand=True, fill="x")
-        ttk.Button(bf, text="기본값", command=self.reset_colors).pack(side="left", padx=(4, 0))
-        ttk.Label(f, text="색상칸 클릭=색 수정 / 추출=범례 막대를 드래그", foreground="#666").pack(anchor="w")
-
-        # 판독 옵션
-        f = ttk.LabelFrame(left, text="4. 판독 옵션", padding=6)
-        f.pack(fill="x", pady=6)
-        ttk.Label(f, text="색상 허용오차").grid(row=0, column=0, sticky="w")
-        ttk.Scale(f, from_=5, to=120, variable=self.v_tol, command=lambda v: self.v_tol.set(int(float(v)))
-                  ).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Label(f, textvariable=self.v_tol, width=4).grid(row=0, column=2)
-        ttk.Label(f, text="샘플 크기(px)").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Combobox(f, values=[1, 3, 5, 7, 9, 15], width=5, state="readonly",
-                     textvariable=self.v_sample).grid(row=1, column=1, sticky="w", padx=4)
-        ttk.Checkbutton(f, text="선형 보간으로 소수 2자리 값 추정", variable=self.v_interp).grid(
-            row=2, column=0, columnspan=3, sticky="w")
-        ttk.Label(f, text="경계 탐색 반경(px)").grid(row=3, column=0, sticky="w", pady=2)
-        ttk.Spinbox(f, from_=10, to=200, width=6, textvariable=self.v_search).grid(row=3, column=1, sticky="w", padx=4)
-        ttk.Checkbutton(f, text="마우스 이동 시 실시간 값 표시", variable=self.v_hover).grid(
-            row=4, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(f, text="검은색(선) 무시", variable=self.v_black).grid(
-            row=5, column=0, sticky="w", pady=2)
-        ttk.Spinbox(f, from_=0, to=120, width=5, textvariable=self.v_black_thr).grid(
-            row=5, column=1, sticky="w", padx=4)
-        ttk.Label(f, text="이하", foreground="#666").grid(row=5, column=2, sticky="w")
-        f.columnconfigure(1, weight=1)
-
-        # 결과 패널
-        f = ttk.LabelFrame(left, text="판독 결과", padding=6)
-        f.pack(fill="x")
-        self.res_swatch = tk.Label(f, text="", width=3, relief="solid", bd=1)
-        self.res_swatch.grid(row=0, column=0, rowspan=2, padx=(0, 8), sticky="ns")
-        self.res_value = tk.StringVar(value="-")
-        self.res_info = tk.StringVar(value="이미지를 가져온 뒤 클릭하세요")
-        tk.Label(f, textvariable=self.res_value, font=(FONT, 14, "bold"), anchor="nw", width=22, height=2,
-                 wraplength=240, justify="left").grid(row=0, column=1, sticky="w")
-        tk.Label(f, textvariable=self.res_info, font=(FONT, 9), anchor="nw", fg="#555", width=36, height=4,
-                 justify="left", wraplength=240).grid(row=1, column=1, sticky="w")
-
-        bf = ttk.Frame(left)
-        bf.pack(fill="x", pady=(6, 0))
-        ttk.Button(bf, text="마커 지우기", command=self.clear_markers).pack(side="left", expand=True, fill="x")
-        ttk.Button(bf, text="결과 복사", command=self.copy_results).pack(side="left", expand=True, fill="x", padx=4)
-        ttk.Button(bf, text="이미지 저장", command=self.save_image).pack(side="left", expand=True, fill="x")
 
         self.canvas = tk.Canvas(right, bg="#2b2b2b", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
 
+        # 판독 결과: 캔버스 우측 상단에 작게 (색+값), ▾ 로 자세한 내용 펼침
+        self.res_box = ctk.CTkFrame(self.canvas, fg_color="white", corner_radius=8, border_width=1,
+                                    border_color="#d1d5db")
+        self.res_box.place(relx=1.0, x=-8, y=8, anchor="ne")
+        top = ctk.CTkFrame(self.res_box, fg_color="transparent")
+        top.pack(padx=6, pady=4)
+        self.res_swatch = ctk.CTkLabel(top, text="", width=22, height=22, corner_radius=4, fg_color="#cccccc")
+        self.res_swatch.pack(side="left")
+        self.res_value = tk.StringVar(value="-")
+        self.res_info = tk.StringVar(value="이미지를 클릭하세요")
+        ctk.CTkLabel(top, textvariable=self.res_value, font=self.f_b, text_color="#111827").pack(
+            side="left", padx=6)
+        self.btn_res = ctk.CTkButton(top, text="▾", width=22, height=22, fg_color="transparent",
+                                     text_color="#555555", hover_color="#e5e7eb", command=self._toggle_result)
+        self.btn_res.pack(side="left")
+        self.res_info_lbl = ctk.CTkLabel(self.res_box, textvariable=self.res_info, font=self.f_s,
+                                         text_color="#4b5563", justify="left", anchor="w", wraplength=300)
+        self._res_open = False
+
         self.status = tk.StringVar(
             value="좌클릭: 마커 추가/선택 | 라벨 드래그: 위치 이동 | 휠: 확대/축소 | 우클릭 드래그: 이동 | Backspace: 선택 마커 삭제")
-        ttk.Label(right, textvariable=self.status, padding=4).pack(fill="x")
+        ctk.CTkLabel(right, textvariable=self.status, font=ctk.CTkFont(family=FONT, size=11),
+                     text_color="#4b5563", anchor="w").pack(fill="x", padx=6, pady=3)
 
         c = self.canvas
         c.bind("<Configure>", lambda e: self.render())
@@ -193,6 +230,26 @@ class App(tk.Tk):
         c.bind("<B3-Motion>", self._on_pan_move)
         c.bind("<MouseWheel>", self._on_wheel)
 
+    def _toggle_options(self):
+        self._opt_open = not self._opt_open
+        if self._opt_open:
+            self.opt_frame.pack(side="bottom", fill="x", padx=8, pady=(2, 4), before=self.btn_opt)
+        else:
+            self.opt_frame.pack_forget()
+        self.btn_opt.configure(text="⚙ 판독 옵션  ▴" if self._opt_open else "⚙ 판독 옵션  ▾")
+
+    def _toggle_result(self):
+        self._res_open = not self._res_open
+        if self._res_open:
+            self.res_info_lbl.pack(fill="x", padx=8, pady=(0, 6))
+        else:
+            self.res_info_lbl.pack_forget()
+        self.btn_res.configure(text="▴" if self._res_open else "▾")
+
+    def _on_n_menu(self, s: str):
+        self.v_n.set(int(s))
+        self._on_n_change()
+
     def _bind_keys(self):
         self.bind("<F2>", lambda e: self.start_capture())
         self.bind("<Control-o>", lambda e: self.open_file())
@@ -203,10 +260,18 @@ class App(tk.Tk):
     # ------------------------------------------------------------ legend
     def _build_legend(self, quiet: bool = True) -> Legend | None:
         try:
+            n = len(self.colors)
+            edges = {}
+            if len(self.edge_vars) == n + 1:
+                for k in range(1, n):
+                    s = self.edge_vars[k].get().strip()
+                    if s:
+                        edges[k] = float(s)
             return Legend(float(self.v_min.get()), float(self.v_max.get()), self.colors,
                           tolerance=self.v_tol.get(), open_ends=self.v_open.get(),
                           unit=self.v_unit.get().strip(), ignore_black=self.v_black.get(),
-                          black_threshold=self.v_black_thr.get())
+                          black_threshold=self.v_black_thr.get(), edges=edges,
+                          shade=self.v_shade.get())
         except (ValueError, tk.TclError) as e:
             if not quiet:
                 messagebox.showerror("입력 오류", str(e))
@@ -227,31 +292,50 @@ class App(tk.Tk):
             self.colors = resample_colors(self.colors, n)
             self._on_legend_change()
 
+    def _make_edge_vars(self, n: int, saved: dict | None = None):
+        """경계값 입력 변수: [0]=최소값, [n]=최대값(상단 입력칸과 공유), 나머지는 비워두면 자동 보간."""
+        saved = saved or {}
+        self.edge_vars = [self.v_min]
+        for k in range(1, n):
+            var = tk.StringVar(value=str(saved.get(str(k), saved.get(k, ""))))
+            var.trace_add("write", lambda *_: self._on_legend_change())
+            self.edge_vars.append(var)
+        self.edge_vars.append(self.v_max)
+
+    def clear_edges(self):
+        for var in self.edge_vars[1:-1]:
+            var.set("")
+
     def _refresh_swatches(self):
-        lg = self._build_legend()
         n = len(self.colors)
-        if len(self._swatch_rows) != n:   # 구간 수가 바뀔 때만 위젯을 다시 만든다 (깜빡임/흔들림 방지)
+        rebuild = len(self._swatch_rows) != n
+        if rebuild:   # 구간 수가 바뀔 때만 위젯을 다시 만든다 (깜빡임/흔들림 방지)
+            self._make_edge_vars(n, self._saved_edges)
+            self._saved_edges = None
             for w in self.swatch_frame.winfo_children():
                 w.destroy()
             self._swatch_rows = []
-            wheel = lambda e: self.swatch_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
             for i in range(n - 1, -1, -1):
-                row = tk.Frame(self.swatch_frame)
-                row.pack(fill="x")
-                sw = tk.Label(row, width=6, height=1, relief="solid", bd=1, cursor="hand2")
-                sw.pack(side="left")
-                sw.bind("<Button-1>", lambda e, k=i: self._edit_color(k))
-                t1 = tk.Label(row, font=(FONT, 9), width=18, anchor="w")
+                row = ctk.CTkFrame(self.swatch_frame, fg_color="transparent")
+                row.pack(fill="x", pady=1)
+                ctk.CTkEntry(row, textvariable=self.edge_vars[i + 1], width=64, height=22, font=self.f_s,
+                             justify="right").pack(side="left")
+                sw = ctk.CTkButton(row, text="", width=34, height=18, corner_radius=3, border_width=1,
+                                   border_color="#6b7280", hover=False,
+                                   command=lambda k=i: self._edit_color(k))
+                sw.pack(side="left", padx=(6, 0))
+                t1 = ctk.CTkLabel(row, text="", font=self.f_s, anchor="w", text_color="#4b5563")
                 t1.pack(side="left", padx=6)
-                t2 = tk.Label(row, font=("Consolas", 8), fg="#888")
-                t2.pack(side="left")
-                for wdg in (row, sw, t1, t2):
-                    wdg.bind("<MouseWheel>", wheel)
-                self._swatch_rows.append((i, sw, t1, t2))
-        for i, sw, t1, t2 in self._swatch_rows:
-            sw.config(bg=self.colors[i])
-            t1.config(text=lg.short(i) if lg else "-")
-            t2.config(text=self.colors[i])
+                self._swatch_rows.append((i, sw, t1))
+            row = ctk.CTkFrame(self.swatch_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkEntry(row, textvariable=self.edge_vars[0], width=64, height=22, font=self.f_s,
+                         justify="right").pack(side="left")
+            ctk.CTkLabel(row, text="← 최소", font=self.f_s, text_color="#9ca3af").pack(side="left", padx=6)
+        lg = self._build_legend()
+        for i, sw, t1 in self._swatch_rows:
+            sw.configure(fg_color=self.colors[i])
+            t1.configure(text=lg.short(i) if lg else "-")
 
     def _edit_color(self, i: int):
         _, hx = colorchooser.askcolor(color=self.colors[i], parent=self, title=f"구간 {i + 1} 색상")
@@ -262,6 +346,7 @@ class App(tk.Tk):
     def reset_colors(self):
         self.colors = list(DEFAULT_COLORS)
         self.v_n.set(len(self.colors))
+        self.n_menu.set(str(len(self.colors)))
         self._on_legend_change()
 
     def toggle_legend_mode(self):
@@ -269,7 +354,7 @@ class App(tk.Tk):
             messagebox.showinfo("안내", "먼저 이미지를 가져오세요 (범례 막대가 포함된 이미지).")
             return
         self.legend_mode = not self.legend_mode
-        self.btn_pick.config(text="추출 취소 (ESC)" if self.legend_mode else "이미지에서 범례 추출")
+        self.btn_pick.configure(text="추출 취소(ESC)" if self.legend_mode else "범례 추출")
         self.status.set("범례 색상 막대를 드래그로 지정하세요 (세로: 위=최대, 가로: 오른쪽=최대)"
                         if self.legend_mode else "")
 
@@ -286,8 +371,8 @@ class App(tk.Tk):
         self.markers.clear()
         self.selected = None
         self.res_value.set("-")
-        self.res_info.set("이미지를 클릭하면 값이 표시됩니다")
-        self.res_swatch.config(bg=self.cget("bg"))
+        self.res_info.set("이미지를 클릭하세요")
+        self.res_swatch.configure(fg_color="#cccccc")
         self.fit()
         self.status.set(f"이미지 {self.img.width} x {self.img.height}px")
 
@@ -473,10 +558,10 @@ class App(tk.Tk):
     def _show_result(self, ix, iy, p: Probe | None):
         if p is None:
             self.res_value.set("-")
-            self.res_info.set("범례(최소/최대) 입력값을 확인하세요")
+            self.res_info.set("범례 입력값을 확인하세요")
             return
         self.res_value.set(p.text)
-        self.res_swatch.config(bg=self.colors[p.idx] if p.idx is not None else "#%02x%02x%02x" % p.rgb)
+        self.res_swatch.configure(fg_color=self.colors[p.idx] if p.idx is not None else "#%02x%02x%02x" % p.rgb)
         lines = [f"좌표 ({ix}, {iy}) · RGB {p.rgb}"]
         if p.idx is not None:
             lo, hi = self.legend_range(p.idx)
@@ -484,7 +569,7 @@ class App(tk.Tk):
             if p.kind == "interp":
                 lines.append(f"아래 경계 {p.d_lo:.1f}px · 위 경계 {p.d_hi:.1f}px 기준 보간")
             elif p.kind == "center":
-                lines.append("경계를 못 찾아 구간 중앙값으로 근사 (탐색 반경 확대)")
+                lines.append("경계를 못 찾아 구간 중앙값으로 근사")
             elif p.kind == "open":
                 lines.append("최대/최소 밖 값도 같은 색이라 보간 불가")
         if math.isfinite(p.distance):
@@ -513,6 +598,7 @@ class App(tk.Tk):
             self._tooltip(e.x, e.y, p.label + u, p)
 
     def _on_press(self, e):
+        self.canvas.focus_set()   # 입력칸에 포커스가 있어도 Backspace로 마커를 지울 수 있게
         self._press = (e.x, e.y, self.ox, self.oy, False)
         self._drag_label = None
         if self.img is None or self.legend_mode:
@@ -596,7 +682,8 @@ class App(tk.Tk):
             return
         self.colors = cols
         self.legend_mode = False
-        self.btn_pick.config(text="이미지에서 범례 추출")
+        self.n_menu.set(str(len(self.colors)))
+        self.btn_pick.configure(text="범례 추출")
         self.status.set("범례 색상을 추출했습니다.")
         self._on_legend_change()
 
@@ -674,6 +761,9 @@ class App(tk.Tk):
                 "open_ends": self.v_open.get(), "delay": self.v_delay.get(), "hover": self.v_hover.get(),
                 "interp": self.v_interp.get(), "search": self.v_search.get(),
                 "ignore_black": self.v_black.get(), "black_thr": self.v_black_thr.get(),
+                "shade": self.v_shade.get(),
+                "edges": {str(k): v.get().strip() for k, v in enumerate(self.edge_vars)
+                          if 0 < k < len(self.edge_vars) - 1 and v.get().strip()},
             })
         except (OSError, tk.TclError):
             pass

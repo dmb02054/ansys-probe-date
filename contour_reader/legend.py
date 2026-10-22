@@ -55,18 +55,31 @@ class Probe:
 class Legend:
     def __init__(self, vmin: float, vmax: float, colors: list[str],
                  tolerance: float = 40.0, open_ends: bool = True, unit: str = "",
-                 ignore_black: bool = True, black_threshold: float = 70.0):
-        if vmax <= vmin:
-            raise ValueError("최대값은 최소값보다 커야 합니다.")
+                 ignore_black: bool = True, black_threshold: float = 70.0,
+                 edges: dict[int, float] | None = None, shade: float = 0.0):
+        """edges: {경계 번호: 값}. 경계 i는 구간 i-1과 i 사이(0=최소값, n=최대값).
+        지정하지 않은 경계는 지정된 값들 사이를 선형 보간한다.
+        shade: 0~100, 밝기(그림자/조명) 차이를 무시하는 정도. 0이면 순수 RGB 거리."""
         if len(colors) < 2:
             raise ValueError("색상은 2개 이상 필요합니다.")
+        n = len(colors)
+        known = {0: float(vmin), n: float(vmax)}
+        for k, v in (edges or {}).items():
+            if 0 < k < n:
+                known[int(k)] = float(v)
+        ks = sorted(known)
+        vals = [known[k] for k in ks]
+        if any(b <= a for a, b in zip(vals, vals[1:])):
+            raise ValueError("범례 값은 아래에서 위로 갈수록 커야 합니다 (최소 < 중간값 < 최대).")
         self.vmin, self.vmax = vmin, vmax
+        self.edges = np.interp(np.arange(n + 1), ks, vals)
         self.colors = list(colors)
         self.tolerance = tolerance
         self.open_ends = open_ends
         self.unit = unit
         self.ignore_black = ignore_black
         self.black_threshold = black_threshold
+        self.shade = min(max(float(shade), 0.0), 100.0)
         self._palette = np.array([hex_to_rgb(c) for c in colors], dtype=float)
 
     @property
@@ -74,8 +87,7 @@ class Legend:
         return len(self.colors)
 
     def band_range(self, i: int) -> tuple[float, float]:
-        step = (self.vmax - self.vmin) / self.n
-        return self.vmin + step * i, self.vmin + step * (i + 1)
+        return float(self.edges[i]), float(self.edges[i + 1])
 
     def describe(self, i: int) -> str:
         lo, hi = self.band_range(i)
@@ -95,8 +107,15 @@ class Legend:
         return f"{fmt(lo)} ~ {fmt(hi)}"
 
     def centers(self) -> np.ndarray:
-        step = (self.vmax - self.vmin) / self.n
-        return self.vmin + step * (np.arange(self.n) + 0.5)
+        return (self.edges[:-1] + self.edges[1:]) / 2
+
+    @staticmethod
+    def _hsv_parts(rgb: np.ndarray):
+        """(밝기 V, 순색 벡터(0~255, 흰색 성분 제거·정규화), 채도 S)."""
+        v = rgb.max(axis=1)
+        pure = rgb - rgb.min(axis=1, keepdims=True)
+        hue = pure / np.maximum(pure.max(axis=1), 1.0)[:, None] * 255.0
+        return v, hue, (v - rgb.min(axis=1)) / np.maximum(v, 1.0)
 
     def black_mask(self, pixels: np.ndarray) -> np.ndarray:
         """검은색(선/테두리) 픽셀 여부. 범례에 어두운 색이 있으면 그보다 낮게 제한."""
@@ -109,8 +128,20 @@ class Legend:
         """(...,3) RGB -> (가장 가까운 구간 번호, 색상 거리). 검은색은 거리 무한대(판단 제외)."""
         px = pixels.reshape(-1, 3).astype(float)
         d = np.empty((len(px), self.n))
-        for k in range(self.n):
-            d[:, k] = np.sqrt(((px - self._palette[k]) ** 2).sum(axis=1))
+        if self.shade > 0:
+            # 그림자는 색을 밝기 배수로, 조명(반사광)은 흰색을 섞는 방향으로 바꾼다.
+            # 그래서 흰색 성분을 뺀 뒤 밝기를 정규화한 '색상'으로 비교하고,
+            # 밝기·채도 차이는 (1 - shade)만큼만 반영한다.
+            w = 1.0 - self.shade / 100.0
+            vpx, hpx, spx = self._hsv_parts(px)
+            vpal, hpal, spal = self._hsv_parts(self._palette)
+            for k in range(self.n):
+                d[:, k] = np.sqrt(((hpx - hpal[k]) ** 2).sum(axis=1)
+                                  + (w * (vpx - vpal[k])) ** 2 + (w * 255.0 * (spx - spal[k])) ** 2)
+            d[spx < 0.12] = np.inf   # 무채색(배경/문자)은 색상 비교가 불안정하므로 제외
+        else:
+            for k in range(self.n):
+                d[:, k] = np.sqrt(((px - self._palette[k]) ** 2).sum(axis=1))
         shape = pixels.shape[:-1]
         dmin = d.min(axis=1)
         dmin[self.black_mask(px)] = np.inf

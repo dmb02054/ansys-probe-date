@@ -22,6 +22,8 @@ DEFAULTS = {
     "search": 60,
     "ignore_black": True,
     "black_thr": 70,
+    "shade": 80,
+    "edges": {},
 }
 
 
